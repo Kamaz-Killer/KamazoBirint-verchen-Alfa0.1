@@ -5,24 +5,37 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string>
+#include <windows.h>
+#include <queue>
 
 #define MAX_LOADSTRING 100
 
-// Глобальные переменные:
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
 WCHAR szWindowClass[MAX_LOADSTRING];
 
-// Игровые константы и переменные
-#define ROOM_WIDTH 15      // Уменьшил для лучшего обзора
-#define ROOM_HEIGHT 10     // Уменьшил для лучшего обзора
-#define ROOMS_X 3
-#define ROOMS_Y 3
-#define TOTAL_WIDTH (ROOM_WIDTH * ROOMS_X)
-#define TOTAL_HEIGHT (ROOM_HEIGHT * ROOMS_Y)
-#define CELL_SIZE 32       // Увеличил размер пикселей
+enum GameState {
+    MENU,
+    DIFFICULTY_SELECT,
+    PLAYING,
+    GAME_OVER,
+    WIN_SCREEN
+};
 
-// Коды ячеек:
+GameState gameState = MENU;
+int selectedDifficulty = 1;
+float currentFPS = 0.0f;
+
+int ROOM_WIDTH = 15;
+int ROOM_HEIGHT = 10;
+int ROOMS_X = 3;
+int ROOMS_Y = 3;
+int TOTAL_WIDTH;
+int TOTAL_HEIGHT;
+#define CELL_SIZE 32
+#define UI_WIDTH 240
+#define MARGIN 10
+
 #define EMPTY 0
 #define PLAYER 1
 #define WALL 2
@@ -30,37 +43,58 @@ WCHAR szWindowClass[MAX_LOADSTRING];
 #define DOOR 4
 #define HEALTH 5
 #define TRAP 6
-#define UNEXPLORED 7       // Для непосещенных комнат
+#define UNEXPLORED 7
+#define KEY 8
+#define EXIT_DOOR 9
+#define FREE_DOOR 10
 
-int map[TOTAL_HEIGHT][TOTAL_WIDTH];
-bool explored[ROOMS_Y][ROOMS_X] = { false }; // Отслеживаем посещенные комнаты
+int* map = nullptr;
+bool* explored = nullptr;
 int currentRoomX = 1, currentRoomY = 1;
 int steps = 0;
 int gold = 0;
 int health = 100;
-int visitedRooms = 1; // Счетчик посещенных комнат
+int keys = 0;
+int visitedRooms = 1;
+int totalRooms = 0;
+bool uiExpanded = true;
+bool godMode = false;
 
-// Прототипы функций
+HDC hdcBuffer = nullptr;
+HBITMAP hbmBuffer = nullptr;
+int bufferWidth = 0;
+int bufferHeight = 0;
+
 void GenerateMap();
 void GenerateRoom(int roomX, int roomY);
 void EnsurePlayerPath();
 void ConnectRooms();
+void EnsureAllRoomsConnected();
 void PlaceDoors();
+void PlaceDoorsInRoom(int roomX, int roomY);
 void PlaceGoldAndItems();
 void SpawnPlayer();
 void ChangeRoom(int dx, int dy);
 POINT FindPlayer();
 void DrawMap(HDC hdc);
 void DrawUI(HDC hdc);
+void DrawMenu(HDC hdc);
+void DrawDifficultySelect(HDC hdc);
+void DrawGameOver(HDC hdc);
+void DrawWinScreen(HDC hdc);
 void MovePlayer(int dx, int dy);
-void SaveGame();
-void LoadGame();
 void DamagePlayer(int damage);
 void HealPlayer(int amount);
 void GenerateRuins(int startX, int startY);
 void CreatePathToExit(int roomX, int roomY);
+void StartNewGame(int difficulty);
+void UpdateFPS();
+void CleanupGame();
+void CreateBuffer(int width, int height);
+void DeleteBuffer();
+void VisitRoom(int roomX, int roomY);
+void RemoveDoorInBothRooms(int x, int y, int dx, int dy);
 
-// Основные функции Windows
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -73,19 +107,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // Инициализация случайных чисел
     srand((unsigned int)time(NULL));
 
-    // Инициализация глобальных строк
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_MY822, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
 
     if (!InitInstance(hInstance, nCmdShow))
         return FALSE;
-
-    // Генерация начальной карты
-    GenerateMap();
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_MY822));
     MSG msg;
@@ -99,6 +128,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
     }
 
+    CleanupGame();
     return (int)msg.wParam;
 }
 
@@ -125,16 +155,18 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
     hInst = hInstance;
 
-    // Рассчитываем размер окна
-    int windowWidth = TOTAL_WIDTH * CELL_SIZE + 220;  // + место для UI
-    int windowHeight = TOTAL_HEIGHT * CELL_SIZE + 50;
+    int uiWidth = uiExpanded ? UI_WIDTH : 50;
+    int windowWidth = TOTAL_WIDTH * CELL_SIZE + uiWidth + MARGIN * 2;
+    int windowHeight = TOTAL_HEIGHT * CELL_SIZE + MARGIN * 2;
 
-    HWND hWnd = CreateWindowW(szWindowClass, L"Рогалик-приключение", WS_OVERLAPPEDWINDOW,
+    HWND hWnd = CreateWindowW(szWindowClass, L"Лабиринт", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, 0, windowWidth, windowHeight,
         nullptr, nullptr, hInstance, nullptr);
 
     if (!hWnd)
         return FALSE;
+
+    CreateBuffer(windowWidth, windowHeight);
 
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
@@ -142,22 +174,98 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     return TRUE;
 }
 
+void CreateBuffer(int width, int height)
+{
+    if (hdcBuffer)
+    {
+        DeleteBuffer();
+    }
+
+    HDC hdc = GetDC(nullptr);
+    hdcBuffer = CreateCompatibleDC(hdc);
+    hbmBuffer = CreateCompatibleBitmap(hdc, width, height);
+    SelectObject(hdcBuffer, hbmBuffer);
+    bufferWidth = width;
+    bufferHeight = height;
+    ReleaseDC(nullptr, hdc);
+}
+
+void DeleteBuffer()
+{
+    if (hbmBuffer)
+    {
+        DeleteObject(hbmBuffer);
+        hbmBuffer = nullptr;
+    }
+    if (hdcBuffer)
+    {
+        DeleteDC(hdcBuffer);
+        hdcBuffer = nullptr;
+    }
+}
+
+void CleanupGame()
+{
+    if (map) delete[] map;
+    if (explored) delete[] explored;
+    DeleteBuffer();
+    map = nullptr;
+    explored = nullptr;
+}
+
+void StartNewGame(int difficulty)
+{
+    CleanupGame();
+
+    if (difficulty == 1)
+    {
+        ROOMS_X = 3;
+        ROOMS_Y = 3;
+    }
+    else if (difficulty == 2)
+    {
+        ROOMS_X = 4;
+        ROOMS_Y = 4;
+    }
+    else
+    {
+        ROOMS_X = 5;
+        ROOMS_Y = 5;
+    }
+
+    TOTAL_WIDTH = ROOM_WIDTH * ROOMS_X;
+    TOTAL_HEIGHT = ROOM_HEIGHT * ROOMS_Y;
+    totalRooms = ROOMS_X * ROOMS_Y;
+
+    map = new int[TOTAL_HEIGHT * TOTAL_WIDTH];
+    explored = new bool[ROOMS_Y * ROOMS_X];
+
+    currentRoomX = 1;
+    currentRoomY = 1;
+    steps = 0;
+    gold = 0;
+    health = 100;
+    keys = 0;
+    visitedRooms = 1;
+    godMode = false;
+
+    GenerateMap();
+    gameState = PLAYING;
+}
+
 void GenerateMap()
 {
-    // Очистка карты
     for (int y = 0; y < TOTAL_HEIGHT; y++)
         for (int x = 0; x < TOTAL_WIDTH; x++)
-            map[y][x] = EMPTY;
+            map[y * TOTAL_WIDTH + x] = EMPTY;
 
-    // Сбрасываем информацию о посещенных комнатах
     for (int y = 0; y < ROOMS_Y; y++)
         for (int x = 0; x < ROOMS_X; x++)
-            explored[y][x] = false;
+            explored[y * ROOMS_X + x] = false;
 
-    explored[currentRoomY][currentRoomX] = true;
+    explored[currentRoomY * ROOMS_X + currentRoomX] = true;
     visitedRooms = 1;
 
-    // Генерация комнат
     for (int roomY = 0; roomY < ROOMS_Y; roomY++)
     {
         for (int roomX = 0; roomX < ROOMS_X; roomX++)
@@ -166,20 +274,16 @@ void GenerateMap()
         }
     }
 
-    // Соединение комнат коридорами
     ConnectRooms();
-
-    // Размещение дверей
+    EnsureAllRoomsConnected();
     PlaceDoors();
-
-    // Обеспечиваем проходимость начальной комнаты
     EnsurePlayerPath();
-
-    // Размещение предметов
     PlaceGoldAndItems();
-
-    // Размещение игрока
     SpawnPlayer();
+
+    int exitX = (ROOMS_X - 1) * ROOM_WIDTH + ROOM_WIDTH / 2;
+    int exitY = (ROOMS_Y - 1) * ROOM_HEIGHT + ROOM_HEIGHT / 2;
+    map[exitY * TOTAL_WIDTH + exitX] = EXIT_DOOR;
 }
 
 void GenerateRoom(int roomX, int roomY)
@@ -187,7 +291,6 @@ void GenerateRoom(int roomX, int roomY)
     int startX = roomX * ROOM_WIDTH;
     int startY = roomY * ROOM_HEIGHT;
 
-    // Внешние стены комнаты
     for (int y = startY; y < startY + ROOM_HEIGHT; y++)
     {
         for (int x = startX; x < startX + ROOM_WIDTH; x++)
@@ -195,12 +298,11 @@ void GenerateRoom(int roomX, int roomY)
             if (y == startY || y == startY + ROOM_HEIGHT - 1 ||
                 x == startX || x == startX + ROOM_WIDTH - 1)
             {
-                map[y][x] = WALL;
+                map[y * TOTAL_WIDTH + x] = WALL;
             }
         }
     }
 
-    // Генерация руин в комнате
     GenerateRuins(startX, startY);
 }
 
@@ -209,15 +311,13 @@ void EnsurePlayerPath()
     int startX = currentRoomX * ROOM_WIDTH;
     int startY = currentRoomY * ROOM_HEIGHT;
 
-    // Гарантируем, что от дверей есть путь
     CreatePathToExit(currentRoomX, currentRoomY);
 
-    // Проверяем и очищаем область вокруг дверей
     int doorPositions[4][2] = {
-        {startX + ROOM_WIDTH / 2, startY},                    // Верхняя дверь
-        {startX + ROOM_WIDTH / 2, startY + ROOM_HEIGHT - 1},  // Нижняя дверь
-        {startX, startY + ROOM_HEIGHT / 2},                   // Левая дверь
-        {startX + ROOM_WIDTH - 1, startY + ROOM_HEIGHT / 2}   // Правая дверь
+        {startX + ROOM_WIDTH / 2, startY},
+        {startX + ROOM_WIDTH / 2, startY + ROOM_HEIGHT - 1},
+        {startX, startY + ROOM_HEIGHT / 2},
+        {startX + ROOM_WIDTH - 1, startY + ROOM_HEIGHT / 2}
     };
 
     for (int i = 0; i < 4; i++)
@@ -225,7 +325,6 @@ void EnsurePlayerPath()
         int x = doorPositions[i][0];
         int y = doorPositions[i][1];
 
-        // Очищаем 3x3 область вокруг двери
         for (int dy = -1; dy <= 1; dy++)
         {
             for (int dx = -1; dx <= 1; dx++)
@@ -235,9 +334,10 @@ void EnsurePlayerPath()
 
                 if (nx >= 0 && nx < TOTAL_WIDTH && ny >= 0 && ny < TOTAL_HEIGHT)
                 {
-                    if (map[ny][nx] == WALL && !(nx == x && ny == y))
+                    int cellType = map[ny * TOTAL_WIDTH + nx];
+                    if (cellType == WALL && !(nx == x && ny == y))
                     {
-                        map[ny][nx] = EMPTY;
+                        map[ny * TOTAL_WIDTH + nx] = EMPTY;
                     }
                 }
             }
@@ -250,107 +350,95 @@ void CreatePathToExit(int roomX, int roomY)
     int startX = roomX * ROOM_WIDTH + ROOM_WIDTH / 2;
     int startY = roomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
 
-    // Создаем пути от центра ко всем дверям
     int doors[4][3] = {
-        {startX, roomY * ROOM_HEIGHT, 0},                     // Вверх
-        {startX, roomY * ROOM_HEIGHT + ROOM_HEIGHT - 1, 1},   // Вниз
-        {roomX * ROOM_WIDTH, startY, 2},                      // Влево
-        {roomX * ROOM_WIDTH + ROOM_WIDTH - 1, startY, 3}      // Вправо
+        {startX, roomY * ROOM_HEIGHT, 0},
+        {startX, roomY * ROOM_HEIGHT + ROOM_HEIGHT - 1, 1},
+        {roomX * ROOM_WIDTH, startY, 2},
+        {roomX * ROOM_WIDTH + ROOM_WIDTH - 1, startY, 3}
     };
 
     for (int i = 0; i < 4; i++)
     {
         int targetX = doors[i][0];
         int targetY = doors[i][1];
-        int direction = doors[i][2];
 
         int currentX = startX;
         int currentY = startY;
 
-        // Прямой путь к двери
         while (currentX != targetX || currentY != targetY)
         {
-            // Очищаем текущую позицию
-            if (map[currentY][currentX] == WALL)
-                map[currentY][currentX] = EMPTY;
+            if (map[currentY * TOTAL_WIDTH + currentX] == WALL)
+                map[currentY * TOTAL_WIDTH + currentX] = EMPTY;
 
-            // Двигаемся к цели
             if (currentX < targetX) currentX++;
             else if (currentX > targetX) currentX--;
             else if (currentY < targetY) currentY++;
             else if (currentY > targetY) currentY--;
         }
 
-        // Очищаем саму дверь
-        if (map[targetY][targetX] == WALL)
-            map[targetY][targetX] = EMPTY;
+        if (map[targetY * TOTAL_WIDTH + targetX] == WALL)
+            map[targetY * TOTAL_WIDTH + targetX] = EMPTY;
     }
 }
 
 void GenerateRuins(int startX, int startY)
 {
-    // Создаем несколько разрушенных стен
-    int numWalls = rand() % 5 + 3; // От 3 до 7 стен
+    int numWalls = rand() % 5 + 3;
 
     for (int w = 0; w < numWalls; w++)
     {
-        int wallLength = rand() % 4 + 2; // Длина стены 2-5 клеток
+        int wallLength = rand() % 4 + 2;
         int startWallX = startX + 2 + rand() % (ROOM_WIDTH - 5);
         int startWallY = startY + 2 + rand() % (ROOM_HEIGHT - 5);
-        int direction = rand() % 2; // 0 - горизонтальная, 1 - вертикальная
+        int direction = rand() % 2;
 
         for (int l = 0; l < wallLength; l++)
         {
             int x = startWallX + (direction == 0 ? l : 0);
             int y = startWallY + (direction == 1 ? l : 0);
 
-            // Проверяем границы комнаты
             if (x >= startX + 1 && x < startX + ROOM_WIDTH - 1 &&
                 y >= startY + 1 && y < startY + ROOM_HEIGHT - 1)
             {
-                // Делаем стену несплошной (пропускаем некоторые клетки)
-                if (rand() % 100 < 80) // 80% шанс поставить стену
+                if (rand() % 100 < 80)
                 {
-                    map[y][x] = WALL;
+                    map[y * TOTAL_WIDTH + x] = WALL;
                 }
             }
         }
     }
 
-    // Добавляем отдельные обломки
     int debrisCount = rand() % 8 + 5;
     for (int d = 0; d < debrisCount; d++)
     {
         int x = startX + 1 + rand() % (ROOM_WIDTH - 2);
         int y = startY + 1 + rand() % (ROOM_HEIGHT - 2);
 
-        if (map[y][x] == EMPTY)
+        if (map[y * TOTAL_WIDTH + x] == EMPTY)
         {
-            map[y][x] = WALL;
+            map[y * TOTAL_WIDTH + x] = WALL;
         }
     }
 }
 
 void ConnectRooms()
 {
-    // Горизонтальные соединения
     for (int roomY = 0; roomY < ROOMS_Y; roomY++)
     {
         for (int roomX = 0; roomX < ROOMS_X - 1; roomX++)
         {
-            if (rand() % 100 < 90) // 90% шанс соединения комнат
+            if (rand() % 100 < 85)
             {
                 int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
                 int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH - 1;
 
-                // Создаем проход
                 for (int y = doorY - 1; y <= doorY + 1; y++)
                 {
                     for (int x = doorX; x <= doorX + 2; x++)
                     {
                         if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
                         {
-                            map[y][x] = EMPTY;
+                            map[y * TOTAL_WIDTH + x] = EMPTY;
                         }
                     }
                 }
@@ -358,30 +446,141 @@ void ConnectRooms()
         }
     }
 
-    // Вертикальные соединения
     for (int roomY = 0; roomY < ROOMS_Y - 1; roomY++)
     {
         for (int roomX = 0; roomX < ROOMS_X; roomX++)
         {
-            if (rand() % 100 < 90) // 90% шанс соединения комнат
+            if (rand() % 100 < 85)
             {
                 int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH / 2;
                 int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT - 1;
 
-                // Создаем проход
                 for (int y = doorY; y <= doorY + 2; y++)
                 {
                     for (int x = doorX - 1; x <= doorX + 1; x++)
                     {
                         if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
                         {
-                            map[y][x] = EMPTY;
+                            map[y * TOTAL_WIDTH + x] = EMPTY;
                         }
                     }
                 }
             }
         }
     }
+}
+
+void EnsureAllRoomsConnected()
+{
+    bool* visited = new bool[ROOMS_X * ROOMS_Y];
+    for (int i = 0; i < ROOMS_X * ROOMS_Y; i++) visited[i] = false;
+
+    std::queue<int> q;
+    q.push(currentRoomY * ROOMS_X + currentRoomX);
+    visited[currentRoomY * ROOMS_X + currentRoomX] = true;
+
+    while (!q.empty())
+    {
+        int idx = q.front();
+        q.pop();
+        int roomY = idx / ROOMS_X;
+        int roomX = idx % ROOMS_X;
+
+        int neighbors[4][2] = {
+            {roomX + 1, roomY},
+            {roomX - 1, roomY},
+            {roomX, roomY + 1},
+            {roomX, roomY - 1}
+        };
+
+        for (int i = 0; i < 4; i++)
+        {
+            int nX = neighbors[i][0];
+            int nY = neighbors[i][1];
+
+            if (nX >= 0 && nX < ROOMS_X && nY >= 0 && nY < ROOMS_Y)
+            {
+                int nIdx = nY * ROOMS_X + nX;
+                if (!visited[nIdx])
+                {
+                    visited[nIdx] = true;
+                    q.push(nIdx);
+
+                    // Создаем соединение
+                    if (nX > roomX) // Правая комната
+                    {
+                        int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
+                        int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH - 1;
+
+                        for (int y = doorY - 1; y <= doorY + 1; y++)
+                        {
+                            for (int x = doorX; x <= doorX + 2; x++)
+                            {
+                                if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
+                                {
+                                    if (map[y * TOTAL_WIDTH + x] == WALL)
+                                        map[y * TOTAL_WIDTH + x] = EMPTY;
+                                }
+                            }
+                        }
+                    }
+                    else if (nX < roomX) // Левая комната
+                    {
+                        int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
+                        int doorX = roomX * ROOM_WIDTH;
+
+                        for (int y = doorY - 1; y <= doorY + 1; y++)
+                        {
+                            for (int x = doorX - 2; x <= doorX + 1; x++)
+                            {
+                                if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
+                                {
+                                    if (map[y * TOTAL_WIDTH + x] == WALL)
+                                        map[y * TOTAL_WIDTH + x] = EMPTY;
+                                }
+                            }
+                        }
+                    }
+                    else if (nY > roomY) // Нижняя комната
+                    {
+                        int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH / 2;
+                        int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT - 1;
+
+                        for (int y = doorY; y <= doorY + 2; y++)
+                        {
+                            for (int x = doorX - 1; x <= doorX + 1; x++)
+                            {
+                                if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
+                                {
+                                    if (map[y * TOTAL_WIDTH + x] == WALL)
+                                        map[y * TOTAL_WIDTH + x] = EMPTY;
+                                }
+                            }
+                        }
+                    }
+                    else if (nY < roomY) // Верхняя комната
+                    {
+                        int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH / 2;
+                        int doorY = roomY * ROOM_HEIGHT;
+
+                        for (int y = doorY - 2; y <= doorY + 1; y++)
+                        {
+                            for (int x = doorX - 1; x <= doorX + 1; x++)
+                            {
+                                if (y >= 0 && y < TOTAL_HEIGHT && x >= 0 && x < TOTAL_WIDTH)
+                                {
+                                    if (map[y * TOTAL_WIDTH + x] == WALL)
+                                        map[y * TOTAL_WIDTH + x] = EMPTY;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    delete[] visited;
 }
 
 void PlaceDoors()
@@ -390,20 +589,124 @@ void PlaceDoors()
     {
         for (int roomX = 0; roomX < ROOMS_X; roomX++)
         {
-            // Правая дверь
-            if (roomX < ROOMS_X - 1)
+            PlaceDoorsInRoom(roomX, roomY);
+        }
+    }
+
+    // Гарантируем минимум одну свободную дверь в каждой комнате
+    for (int roomY = 0; roomY < ROOMS_Y; roomY++)
+    {
+        for (int roomX = 0; roomX < ROOMS_X; roomX++)
+        {
+            int startX = roomX * ROOM_WIDTH;
+            int startY = roomY * ROOM_HEIGHT;
+
+            bool hasFree = false;
+            std::vector<std::pair<int, int>> doorCells;
+
+            // Собираем все ячейки дверей в комнате
+            for (int y = startY; y < startY + ROOM_HEIGHT; y++)
             {
-                int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH - 1;
-                int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
-                map[doorY][doorX] = DOOR;
+                for (int x = startX; x < startX + ROOM_WIDTH; x++)
+                {
+                    if (map[y * TOTAL_WIDTH + x] == FREE_DOOR)
+                    {
+                        hasFree = true;
+                        break;
+                    }
+                    if (map[y * TOTAL_WIDTH + x] == DOOR)
+                    {
+                        doorCells.push_back({ x, y });
+                    }
+                }
+                if (hasFree) break;
             }
 
-            // Нижняя дверь
-            if (roomY < ROOMS_Y - 1)
+            // Если нет свободной двери, заменяем одну
+            if (!hasFree && doorCells.size() > 0)
             {
-                int doorX = roomX * ROOM_WIDTH + ROOM_WIDTH / 2;
-                int doorY = roomY * ROOM_HEIGHT + ROOM_HEIGHT - 1;
-                map[doorY][doorX] = DOOR;
+                int idx = rand() % doorCells.size();
+                int x = doorCells[idx].first;
+                int y = doorCells[idx].second;
+                map[y * TOTAL_WIDTH + x] = FREE_DOOR;
+            }
+        }
+    }
+}
+
+void PlaceDoorsInRoom(int roomX, int roomY)
+{
+    int startX = roomX * ROOM_WIDTH;
+    int startY = roomY * ROOM_HEIGHT;
+
+    // Правая дверь (вертикальная 1x3)
+    if (roomX < ROOMS_X - 1)
+    {
+        int doorX = startX + ROOM_WIDTH - 1;
+        int doorY = startY + ROOM_HEIGHT / 2;
+        int doorType = (rand() % 100 < 60) ? DOOR : FREE_DOOR;
+
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            int y = doorY + dy;
+            if (y >= 0 && y < TOTAL_HEIGHT)
+            {
+                if (map[y * TOTAL_WIDTH + doorX] == EMPTY)
+                    map[y * TOTAL_WIDTH + doorX] = doorType;
+            }
+        }
+    }
+
+    // Нижняя дверь (горизонтальная 3x1)
+    if (roomY < ROOMS_Y - 1)
+    {
+        int doorX = startX + ROOM_WIDTH / 2;
+        int doorY = startY + ROOM_HEIGHT - 1;
+        int doorType = (rand() % 100 < 60) ? DOOR : FREE_DOOR;
+
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int x = doorX + dx;
+            if (x >= 0 && x < TOTAL_WIDTH)
+            {
+                if (map[doorY * TOTAL_WIDTH + x] == EMPTY)
+                    map[doorY * TOTAL_WIDTH + x] = doorType;
+            }
+        }
+    }
+
+    // Верхняя дверь (горизонтальная 3x1)
+    if (roomY > 0)
+    {
+        int doorX = startX + ROOM_WIDTH / 2;
+        int doorY = startY;
+        int doorType = (rand() % 100 < 60) ? DOOR : FREE_DOOR;
+
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int x = doorX + dx;
+            if (x >= 0 && x < TOTAL_WIDTH)
+            {
+                if (map[doorY * TOTAL_WIDTH + x] == EMPTY)
+                    map[doorY * TOTAL_WIDTH + x] = doorType;
+            }
+        }
+    }
+
+    // Левая дверь (вертикальная 1x3)
+    if (roomX > 0)
+    {
+        int doorX = startX;
+        int doorY = startY + ROOM_HEIGHT / 2;
+        int doorType = (rand() % 100 < 60) ? DOOR : FREE_DOOR;
+
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            int y = doorY + dy;
+            if (y >= 0 && y < TOTAL_HEIGHT)
+            {
+                if (map[y * TOTAL_WIDTH + doorX] == EMPTY)
+                    map[y * TOTAL_WIDTH + doorX] = doorType;
             }
         }
     }
@@ -411,7 +714,10 @@ void PlaceDoors()
 
 void PlaceGoldAndItems()
 {
-    // Размещаем золото
+    int healthCount = 8;
+    if (selectedDifficulty == 2) healthCount = 5;
+    if (selectedDifficulty == 3) healthCount = 3;
+
     for (int i = 0; i < 30; i++)
     {
         int roomX = rand() % ROOMS_X;
@@ -419,23 +725,21 @@ void PlaceGoldAndItems()
         int x = roomX * ROOM_WIDTH + 2 + rand() % (ROOM_WIDTH - 4);
         int y = roomY * ROOM_HEIGHT + 2 + rand() % (ROOM_HEIGHT - 4);
 
-        if (map[y][x] == EMPTY)
-            map[y][x] = GOLD;
+        if (map[y * TOTAL_WIDTH + x] == EMPTY)
+            map[y * TOTAL_WIDTH + x] = GOLD;
     }
 
-    // Размещаем аптечки
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < healthCount; i++)
     {
         int roomX = rand() % ROOMS_X;
         int roomY = rand() % ROOMS_Y;
         int x = roomX * ROOM_WIDTH + 2 + rand() % (ROOM_WIDTH - 4);
         int y = roomY * ROOM_HEIGHT + 2 + rand() % (ROOM_HEIGHT - 4);
 
-        if (map[y][x] == EMPTY)
-            map[y][x] = HEALTH;
+        if (map[y * TOTAL_WIDTH + x] == EMPTY)
+            map[y * TOTAL_WIDTH + x] = HEALTH;
     }
 
-    // Размещаем ловушки
     for (int i = 0; i < 12; i++)
     {
         int roomX = rand() % ROOMS_X;
@@ -443,18 +747,28 @@ void PlaceGoldAndItems()
         int x = roomX * ROOM_WIDTH + 2 + rand() % (ROOM_WIDTH - 4);
         int y = roomY * ROOM_HEIGHT + 2 + rand() % (ROOM_HEIGHT - 4);
 
-        if (map[y][x] == EMPTY)
-            map[y][x] = TRAP;
+        if (map[y * TOTAL_WIDTH + x] == EMPTY)
+            map[y * TOTAL_WIDTH + x] = TRAP;
+    }
+
+    int keyCount = 3 + rand() % 3;
+    for (int i = 0; i < keyCount; i++)
+    {
+        int roomX = rand() % ROOMS_X;
+        int roomY = rand() % ROOMS_Y;
+        int x = roomX * ROOM_WIDTH + 2 + rand() % (ROOM_WIDTH - 4);
+        int y = roomY * ROOM_HEIGHT + 2 + rand() % (ROOM_HEIGHT - 4);
+
+        if (map[y * TOTAL_WIDTH + x] == EMPTY)
+            map[y * TOTAL_WIDTH + x] = KEY;
     }
 }
 
 void SpawnPlayer()
 {
-    // Центральная позиция в текущей комнате
     int spawnX = currentRoomX * ROOM_WIDTH + ROOM_WIDTH / 2;
     int spawnY = currentRoomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
 
-    // Ищем ближайшую пустую клетку
     for (int radius = 0; radius < 3; radius++)
     {
         for (int dy = -radius; dy <= radius; dy++)
@@ -466,9 +780,9 @@ void SpawnPlayer()
 
                 if (x >= 0 && x < TOTAL_WIDTH && y >= 0 && y < TOTAL_HEIGHT)
                 {
-                    if (map[y][x] == EMPTY)
+                    if (map[y * TOTAL_WIDTH + x] == EMPTY)
                     {
-                        map[y][x] = PLAYER;
+                        map[y * TOTAL_WIDTH + x] = PLAYER;
                         return;
                     }
                 }
@@ -476,8 +790,61 @@ void SpawnPlayer()
         }
     }
 
-    // Если не нашли пустую клетку, очищаем центр
-    map[spawnY][spawnX] = PLAYER;
+    map[spawnY * TOTAL_WIDTH + spawnX] = PLAYER;
+}
+
+void VisitRoom(int roomX, int roomY)
+{
+    if (roomX >= 0 && roomX < ROOMS_X && roomY >= 0 && roomY < ROOMS_Y)
+    {
+        if (!explored[roomY * ROOMS_X + roomX])
+        {
+            explored[roomY * ROOMS_X + roomX] = true;
+            visitedRooms++;
+        }
+    }
+}
+
+void RemoveDoorInBothRooms(int x, int y, int dx, int dy)
+{
+    // Удаляем дверь в текущей клетке
+    map[y * TOTAL_WIDTH + x] = EMPTY;
+
+    // Удаляем дверь в соседней комнате
+    int neighborX = x + dx;
+    int neighborY = y + dy;
+
+    if (neighborX >= 0 && neighborX < TOTAL_WIDTH && neighborY >= 0 && neighborY < TOTAL_HEIGHT)
+    {
+        if (map[neighborY * TOTAL_WIDTH + neighborX] == DOOR)
+        {
+            map[neighborY * TOTAL_WIDTH + neighborX] = EMPTY;
+        }
+    }
+
+    // Удаляем все смежные ячейки двери в соседней комнате (3x1 или 1x3)
+    if (dx != 0) // Вертикальная дверь, ищем соседей по Y
+    {
+        for (int dy2 = -1; dy2 <= 1; dy2++)
+        {
+            int ny = y + dy2;
+            if (ny >= 0 && ny < TOTAL_HEIGHT && map[ny * TOTAL_WIDTH + neighborX] == DOOR)
+            {
+                map[ny * TOTAL_WIDTH + neighborX] = EMPTY;
+            }
+        }
+    }
+    else // Горизонтальная дверь, ищем соседей по X
+    {
+        for (int dx2 = -1; dx2 <= 1; dx2++)
+        {
+            int nx = x + dx2;
+            if (nx >= 0 && nx < TOTAL_WIDTH && map[neighborY * TOTAL_WIDTH + nx] == DOOR)
+            {
+                map[neighborY * TOTAL_WIDTH + nx] = EMPTY;
+            }
+        }
+    }
 }
 
 void ChangeRoom(int dx, int dy)
@@ -491,45 +858,38 @@ void ChangeRoom(int dx, int dy)
         currentRoomX = newRoomX;
         currentRoomY = newRoomY;
 
-        // Отмечаем комнату как посещенную
-        if (!explored[currentRoomY][currentRoomX])
-        {
-            explored[currentRoomY][currentRoomX] = true;
-            visitedRooms++;
-        }
+        VisitRoom(currentRoomX, currentRoomY);
 
-        // Перемещаем игрока в новую комнату
         POINT playerPos = FindPlayer();
         if (playerPos.x != -1 && playerPos.y != -1)
         {
-            map[playerPos.y][playerPos.x] = EMPTY;
+            map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
         }
 
-        // Помещаем игрока у двери в новой комнате
         int newPlayerX, newPlayerY;
 
-        if (dx == 1) // Перешли вправо
+        if (dx == 1)
         {
             newPlayerX = newRoomX * ROOM_WIDTH + 1;
             newPlayerY = newRoomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
         }
-        else if (dx == -1) // Перешли влево
+        else if (dx == -1)
         {
             newPlayerX = newRoomX * ROOM_WIDTH + ROOM_WIDTH - 2;
             newPlayerY = newRoomY * ROOM_HEIGHT + ROOM_HEIGHT / 2;
         }
-        else if (dy == 1) // Перешли вниз
+        else if (dy == 1)
         {
             newPlayerX = newRoomX * ROOM_WIDTH + ROOM_WIDTH / 2;
             newPlayerY = newRoomY * ROOM_HEIGHT + 1;
         }
-        else // Перешли вверх
+        else
         {
             newPlayerX = newRoomX * ROOM_WIDTH + ROOM_WIDTH / 2;
             newPlayerY = newRoomY * ROOM_HEIGHT + ROOM_HEIGHT - 2;
         }
 
-        map[newPlayerY][newPlayerX] = PLAYER;
+        map[newPlayerY * TOTAL_WIDTH + newPlayerX] = PLAYER;
     }
 }
 
@@ -540,7 +900,7 @@ POINT FindPlayer()
     {
         for (int x = 0; x < TOTAL_WIDTH; x++)
         {
-            if (map[y][x] == PLAYER)
+            if (map[y * TOTAL_WIDTH + x] == PLAYER)
             {
                 playerPos.x = x;
                 playerPos.y = y;
@@ -553,50 +913,97 @@ POINT FindPlayer()
 
 void DrawMap(HDC hdc)
 {
-    // Определяем кисти для разных типов клеток
-    HBRUSH brushes[8];
-    brushes[EMPTY] = CreateSolidBrush(RGB(30, 30, 40));     // Темно-синий фон
-    brushes[PLAYER] = CreateSolidBrush(RGB(0, 255, 0));     // Зеленый игрок
-    brushes[WALL] = CreateSolidBrush(RGB(100, 70, 50));     // Коричневые стены
-    brushes[GOLD] = CreateSolidBrush(RGB(255, 215, 0));     // Золото
-    brushes[DOOR] = CreateSolidBrush(RGB(160, 120, 80));    // Деревянные двери
-    brushes[HEALTH] = CreateSolidBrush(RGB(255, 50, 50));   // Красное здоровье
-    brushes[TRAP] = CreateSolidBrush(RGB(180, 0, 180));     // Фиолетовые ловушки
-    brushes[UNEXPLORED] = CreateSolidBrush(RGB(20, 20, 25)); // Темнее для непосещенных
+    HBRUSH brushes[11];
+    brushes[EMPTY] = CreateSolidBrush(RGB(30, 30, 40));
+    brushes[PLAYER] = CreateSolidBrush(RGB(0, 255, 0));
+    brushes[WALL] = CreateSolidBrush(RGB(100, 70, 50));
+    brushes[GOLD] = CreateSolidBrush(RGB(255, 215, 0));
+    brushes[DOOR] = CreateSolidBrush(RGB(160, 120, 80));
+    brushes[HEALTH] = CreateSolidBrush(RGB(255, 50, 50));
+    brushes[TRAP] = CreateSolidBrush(RGB(180, 0, 180));
+    brushes[UNEXPLORED] = CreateSolidBrush(RGB(20, 20, 25));
+    brushes[KEY] = CreateSolidBrush(RGB(200, 200, 0));
+    brushes[EXIT_DOOR] = CreateSolidBrush(RGB(0, 200, 200));
+    brushes[FREE_DOOR] = CreateSolidBrush(RGB(100, 150, 160));
 
-    HFONT hFont = CreateFont(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT hFont = CreateFont(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
     HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+    // Вычисляем смещение камеры
+    int cameraOffsetX = 0;
+    int cameraOffsetY = 0;
+
+    if (ROOMS_X > 1)
+    {
+        int mapViewWidth = TOTAL_WIDTH * CELL_SIZE;
+        int screenWidth = bufferWidth - UI_WIDTH - MARGIN * 2;
+
+        if (mapViewWidth > screenWidth)
+        {
+            int roomWidth = ROOM_WIDTH * CELL_SIZE;
+            int cameraX = currentRoomX * roomWidth;
+            int maxOffset = mapViewWidth - screenWidth;
+
+            if (cameraX + roomWidth > screenWidth)
+            {
+                cameraOffsetX = cameraX + roomWidth - screenWidth + CELL_SIZE * 2;
+            }
+
+            if (cameraOffsetX < 0) cameraOffsetX = 0;
+            if (cameraOffsetX > maxOffset) cameraOffsetX = maxOffset;
+        }
+    }
+
+    if (ROOMS_Y > 1)
+    {
+        int mapViewHeight = TOTAL_HEIGHT * CELL_SIZE;
+        int screenHeight = bufferHeight - MARGIN * 2;
+
+        if (mapViewHeight > screenHeight)
+        {
+            int roomHeight = ROOM_HEIGHT * CELL_SIZE;
+            int cameraY = currentRoomY * roomHeight;
+            int maxOffset = mapViewHeight - screenHeight;
+
+            if (cameraY + roomHeight > screenHeight)
+            {
+                cameraOffsetY = cameraY + roomHeight - screenHeight + CELL_SIZE * 2;
+            }
+
+            if (cameraOffsetY < 0) cameraOffsetY = 0;
+            if (cameraOffsetY > maxOffset) cameraOffsetY = maxOffset;
+        }
+    }
 
     for (int y = 0; y < TOTAL_HEIGHT; y++)
     {
         for (int x = 0; x < TOTAL_WIDTH; x++)
         {
-            // Определяем, в какой комнате находится клетка
             int roomX = x / ROOM_WIDTH;
             int roomY = y / ROOM_HEIGHT;
 
-            // Если комната не посещена, рисуем как непосещенную
-            int cellType = map[y][x];
+            int cellType = map[y * TOTAL_WIDTH + x];
             bool isCurrentRoom = (roomX == currentRoomX && roomY == currentRoomY);
 
-            if (!explored[roomY][roomX] && !isCurrentRoom)
+            if (!explored[roomY * ROOMS_X + roomX] && !isCurrentRoom)
             {
                 cellType = UNEXPLORED;
             }
 
-            // Определяем границы клетки
-            int x1 = x * CELL_SIZE;
-            int y1 = y * CELL_SIZE;
+            int x1 = MARGIN + x * CELL_SIZE - cameraOffsetX;
+            int y1 = MARGIN + y * CELL_SIZE - cameraOffsetY;
             int x2 = x1 + CELL_SIZE;
             int y2 = y1 + CELL_SIZE;
 
-            // Заливаем клетку цветом
+            // Пропускаем ячейки за пределами экрана
+            if (x2 < MARGIN || x1 > bufferWidth - UI_WIDTH || y2 < MARGIN || y1 > bufferHeight)
+                continue;
+
             RECT cellRect = { x1, y1, x2, y2 };
             FillRect(hdc, &cellRect, brushes[cellType]);
 
-            // Рисуем границу клетки
             HPEN hPen = CreatePen(PS_SOLID, 1, RGB(50, 50, 60));
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
 
@@ -609,7 +1016,6 @@ void DrawMap(HDC hdc)
             SelectObject(hdc, hOldPen);
             DeleteObject(hPen);
 
-            // Символы для клеток
             if (cellType != UNEXPLORED)
             {
                 wchar_t symbol = L' ';
@@ -620,8 +1026,11 @@ void DrawMap(HDC hdc)
                 case WALL: symbol = L'#'; break;
                 case GOLD: symbol = L'$'; break;
                 case DOOR: symbol = L'+'; break;
+                case FREE_DOOR: symbol = L'-'; break;
                 case HEALTH: symbol = L'♥'; break;
                 case TRAP: symbol = L'^'; break;
+                case KEY: symbol = L'K'; break;
+                case EXIT_DOOR: symbol = L'E'; break;
                 }
 
                 if (symbol != L' ')
@@ -638,7 +1047,6 @@ void DrawMap(HDC hdc)
             }
             else
             {
-                // Для непосещенных комнат - знак вопроса
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, RGB(100, 100, 100));
 
@@ -652,12 +1060,10 @@ void DrawMap(HDC hdc)
         }
     }
 
-    // Восстанавливаем старый шрифт
     SelectObject(hdc, hOldFont);
     DeleteObject(hFont);
 
-    // Удаляем кисти
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 11; i++)
     {
         DeleteObject(brushes[i]);
     }
@@ -665,22 +1071,51 @@ void DrawMap(HDC hdc)
 
 void DrawUI(HDC hdc)
 {
-    int uiX = TOTAL_WIDTH * CELL_SIZE + 10;
-    int uiY = 10;
+    int mapWidth = TOTAL_WIDTH * CELL_SIZE;
+    int uiX = mapWidth + MARGIN * 2;
+    int uiY = MARGIN;
 
-    // Создаем шрифт для UI
-    HFONT hFont = CreateFont(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+    if (!uiExpanded)
+    {
+        RECT buttonRect = { uiX, uiY, uiX + 30, uiY + 30 };
+        HBRUSH hBrush = CreateSolidBrush(RGB(100, 100, 150));
+        FillRect(hdc, &buttonRect, hBrush);
+        DeleteObject(hBrush);
+
+        HPEN hPen = CreatePen(PS_SOLID, 2, RGB(200, 200, 200));
+        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, buttonRect.left, buttonRect.top, buttonRect.right, buttonRect.bottom);
+        SelectObject(hdc, hOldPen);
+        DeleteObject(hPen);
+
+        HFONT hFont = CreateFont(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+        HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        TextOut(hdc, uiX + 8, uiY + 5, L"I", 1);
+
+        SelectObject(hdc, hOldFont);
+        DeleteObject(hFont);
+        return;
+    }
+
+    HFONT hFont = CreateFont(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HFONT hSmallFont = CreateFont(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
     HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
 
-    // Рисуем панель информации с фоном
-    RECT uiRect = { uiX - 10, uiY - 10, uiX + 200, uiY + 280 };
+    RECT uiRect = { uiX - 10, uiY - 10, uiX + UI_WIDTH, bufferHeight };
     HBRUSH hBrush = CreateSolidBrush(RGB(240, 240, 245));
     FillRect(hdc, &uiRect, hBrush);
     DeleteObject(hBrush);
 
-    // Рамка для UI
     HPEN hPen = CreatePen(PS_SOLID, 2, RGB(100, 100, 150));
     HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
     SelectObject(hdc, GetStockObject(NULL_BRUSH));
@@ -690,23 +1125,21 @@ void DrawUI(HDC hdc)
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Заголовок
     SetTextColor(hdc, RGB(50, 50, 150));
-    TextOut(hdc, uiX, uiY, L"=== ИГРОВАЯ СТАТИСТИКА ===", 26);
+    TextOut(hdc, uiX, uiY, L"СТАТИСТИКА", 11);
 
-    // Здоровье
-    uiY += 40;
+    uiY += 30;
     SetTextColor(hdc, RGB(200, 50, 50));
 
-    std::wstring healthStr = L"Здоровье: " + std::to_wstring(health) + L"/100";
+    std::wstring healthStr = L"HP: " + std::to_wstring(health) + L"/100";
+    if (godMode) healthStr += L" [GOD]";
     TextOut(hdc, uiX, uiY, healthStr.c_str(), (int)healthStr.length());
 
-    // Полоска здоровья
-    int healthBarWidth = 150;
+    int healthBarWidth = 130;
     int currentHealthWidth = (health * healthBarWidth) / 100;
 
-    RECT healthBarBg = { uiX, uiY + 25, uiX + healthBarWidth, uiY + 40 };
-    RECT healthBarFg = { uiX, uiY + 25, uiX + currentHealthWidth, uiY + 40 };
+    RECT healthBarBg = { uiX, uiY + 20, uiX + healthBarWidth, uiY + 30 };
+    RECT healthBarFg = { uiX, uiY + 20, uiX + currentHealthWidth, uiY + 30 };
 
     HBRUSH hRedBrush = CreateSolidBrush(RGB(255, 50, 50));
     HBRUSH hGreenBrush = CreateSolidBrush(RGB(50, 255, 100));
@@ -717,75 +1150,273 @@ void DrawUI(HDC hdc)
     DeleteObject(hRedBrush);
     DeleteObject(hGreenBrush);
 
-    // Остальная статистика
-    uiY += 60;
+    uiY += 45;
     SetTextColor(hdc, RGB(30, 30, 30));
+    SelectObject(hdc, hSmallFont);
 
     std::wstring goldStr = L"Золото: " + std::to_wstring(gold);
     TextOut(hdc, uiX, uiY, goldStr.c_str(), (int)goldStr.length());
 
-    uiY += 30;
+    uiY += 25;
+    std::wstring keysStr = L"Ключи: " + std::to_wstring(keys);
+    TextOut(hdc, uiX, uiY, keysStr.c_str(), (int)keysStr.length());
+
+    uiY += 25;
     std::wstring stepsStr = L"Шаги: " + std::to_wstring(steps);
     TextOut(hdc, uiX, uiY, stepsStr.c_str(), (int)stepsStr.length());
 
-    uiY += 30;
+    uiY += 25;
     std::wstring roomStr = L"Комната: [" + std::to_wstring(currentRoomX + 1) +
         L"," + std::to_wstring(currentRoomY + 1) + L"]";
     TextOut(hdc, uiX, uiY, roomStr.c_str(), (int)roomStr.length());
 
-    uiY += 30;
-    std::wstring visitedStr = L"Исследовано: " + std::to_wstring(visitedRooms) +
-        L"/" + std::to_wstring(ROOMS_X * ROOMS_Y);
+    uiY += 25;
+    std::wstring visitedStr = L"Комнат: " + std::to_wstring(visitedRooms) +
+        L"/" + std::to_wstring(totalRooms);
     TextOut(hdc, uiX, uiY, visitedStr.c_str(), (int)visitedStr.length());
 
-    // Управление
-    uiY += 50;
-    SetTextColor(hdc, RGB(80, 80, 80));
-    TextOut(hdc, uiX, uiY, L"=== УПРАВЛЕНИЕ ===", 17);
+    uiY += 40;
+    std::wstring fpsStr = L"FPS: " + std::to_wstring((int)currentFPS);
+    TextOut(hdc, uiX, uiY, fpsStr.c_str(), (int)fpsStr.length());
+
+    uiY += 45;
+    SelectObject(hdc, hFont);
+    SetTextColor(hdc, RGB(50, 50, 100));
+    TextOut(hdc, uiX, uiY, L"ЛЕГЕНДА", 7);
+
+    uiY += 25;
+    SetTextColor(hdc, RGB(30, 30, 30));
+    SelectObject(hdc, hSmallFont);
+
+    TextOut(hdc, uiX, uiY, L"@ - Вы", 6);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"$ - Золото", 10);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"K - Ключ", 8);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"+ - Дверь (ключ)", 16);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"- - Дверь (свободна)", 20);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"♥ - Лечение", 12);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"^ - Ловушка", 11);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"E - Выход", 9);
 
     uiY += 30;
-    TextOut(hdc, uiX, uiY, L"Стрелки - движение", 19);
-
-    uiY += 25;
-    TextOut(hdc, uiX, uiY, L"S - сохранить", 13);
-
-    uiY += 25;
-    TextOut(hdc, uiX, uiY, L"F - загрузить", 14);
-
-    uiY += 25;
-    TextOut(hdc, uiX, uiY, L"R - новая игра", 14);
-
-    uiY += 25;
-    TextOut(hdc, uiX, uiY, L"ESC - выход", 12);
-
-    // Легенда
-    uiY += 50;
+    SelectObject(hdc, hFont);
     SetTextColor(hdc, RGB(50, 50, 100));
-    TextOut(hdc, uiX, uiY, L"=== ЛЕГЕНДА ===", 15);
+    TextOut(hdc, uiX, uiY, L"УПРАВЛЕНИЕ", 10);
 
     uiY += 25;
-    SetTextColor(hdc, RGB(0, 200, 0));
-    TextOut(hdc, uiX, uiY, L"@ - Вы", 5);
+    SetTextColor(hdc, RGB(30, 30, 30));
+    SelectObject(hdc, hSmallFont);
 
-    uiY += 20;
-    SetTextColor(hdc, RGB(200, 160, 0));
-    TextOut(hdc, uiX, uiY, L"$ - Золото", 10);
+    TextOut(hdc, uiX, uiY, L"<-> Движение", 12);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"I - Меню", 8);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"G - Режим Бога", 15);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"R - Новая игра", 14);
+    uiY += 18;
+    TextOut(hdc, uiX, uiY, L"ESC - Выход", 11);
 
-    uiY += 20;
-    SetTextColor(hdc, RGB(200, 50, 50));
-    TextOut(hdc, uiX, uiY, L"♥ - Здоровье", 12);
-
-    uiY += 20;
-    SetTextColor(hdc, RGB(180, 0, 180));
-    TextOut(hdc, uiX, uiY, L"^ - Ловушка", 11);
-
-    uiY += 20;
-    SetTextColor(hdc, RGB(160, 120, 80));
-    TextOut(hdc, uiX, uiY, L"+ - Дверь", 9);
-
-    // Восстанавливаем старый шрифт
     SelectObject(hdc, hOldFont);
     DeleteObject(hFont);
+    DeleteObject(hSmallFont);
+}
+
+void DrawMenu(HDC hdc)
+{
+    HFONT hTitleFont = CreateFont(48, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HFONT hFont = CreateFont(32, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hTitleFont);
+
+    RECT bgRect = { 0, 0, 960, 680 };
+    HBRUSH hBgBrush = CreateSolidBrush(RGB(20, 20, 40));
+    FillRect(hdc, &bgRect, hBgBrush);
+    DeleteObject(hBgBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0, 255, 100));
+
+    wchar_t title[] = L"Лабиринт";
+    SIZE titleSize;
+    GetTextExtentPoint32(hdc, title, (int)wcslen(title), &titleSize);
+    TextOut(hdc, (960 - titleSize.cx) / 2, 50, title, (int)wcslen(title));
+
+    SelectObject(hdc, hFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+
+    wchar_t subtitle[] = L"Побегите от Зло_Трактора!";
+    GetTextExtentPoint32(hdc, subtitle, (int)wcslen(subtitle), &titleSize);
+    TextOut(hdc, (960 - titleSize.cx) / 2, 150, subtitle, (int)wcslen(subtitle));
+
+    SetTextColor(hdc, RGB(100, 200, 255));
+    wchar_t pressKey[] = L"Нажмите ENTER для выбора сложности";
+    GetTextExtentPoint32(hdc, pressKey, (int)wcslen(pressKey), &titleSize);
+    TextOut(hdc, (960 - titleSize.cx) / 2, 350, pressKey, (int)wcslen(pressKey));
+
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hFont);
+    DeleteObject(hTitleFont);
+}
+
+void DrawDifficultySelect(HDC hdc)
+{
+    HFONT hTitleFont = CreateFont(36, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HFONT hFont = CreateFont(28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hTitleFont);
+
+    RECT bgRect = { 0, 0, 960, 680 };
+    HBRUSH hBgBrush = CreateSolidBrush(RGB(20, 20, 40));
+    FillRect(hdc, &bgRect, hBgBrush);
+    DeleteObject(hBgBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0, 255, 100));
+
+    wchar_t title[] = L"Выберите сложность";
+    SIZE titleSize;
+    GetTextExtentPoint32(hdc, title, (int)wcslen(title), &titleSize);
+    TextOut(hdc, (960 - titleSize.cx) / 2, 50, title, (int)wcslen(title));
+
+    SelectObject(hdc, hFont);
+
+    int difficulties[3][2] = {
+        {200, 200},
+        {200, 300},
+        {200, 400}
+    };
+
+    const wchar_t* diffNames[] = { L"1. ЛЕГКО (3x3)", L"2. НОРМАЛЬНО (4x4)", L"3. СЛОЖНО (5x5)" };
+    const wchar_t* diffDescs[] = {
+        L"Много хилок, мало ловушек",
+        L"Сбалансировано",
+        L"Мало хилок, много ловушек"
+    };
+
+    for (int i = 0; i < 3; i++)
+    {
+        if (i + 1 == selectedDifficulty)
+            SetTextColor(hdc, RGB(255, 100, 100));
+        else
+            SetTextColor(hdc, RGB(200, 200, 200));
+
+        TextOut(hdc, difficulties[i][0], difficulties[i][1], diffNames[i], (int)wcslen(diffNames[i]));
+
+        SetTextColor(hdc, RGB(150, 150, 150));
+        TextOut(hdc, difficulties[i][0] + 40, difficulties[i][1] + 40, diffDescs[i], (int)wcslen(diffDescs[i]));
+    }
+
+    SetTextColor(hdc, RGB(100, 200, 255));
+    SelectObject(hdc, hTitleFont);
+    wchar_t hint[] = L"Нажмите ENTER для старта";
+    GetTextExtentPoint32(hdc, hint, (int)wcslen(hint), &titleSize);
+    TextOut(hdc, (960 - titleSize.cx) / 2, 550, hint, (int)wcslen(hint));
+
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hFont);
+    DeleteObject(hTitleFont);
+}
+
+void DrawGameOver(HDC hdc)
+{
+    HFONT hFont = CreateFont(48, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HFONT hSmallFont = CreateFont(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+    RECT bgRect = { 0, 0, 960, 680 };
+    HBRUSH hBgBrush = CreateSolidBrush(RGB(40, 20, 20));
+    FillRect(hdc, &bgRect, hBgBrush);
+    DeleteObject(hBgBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 50, 50));
+
+    wchar_t gameOverText[] = L"ВОДА НА ТРАКТОРЕ!";
+    SIZE textSize;
+    GetTextExtentPoint32(hdc, gameOverText, (int)wcslen(gameOverText), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 150, gameOverText, (int)wcslen(gameOverText));
+
+    SelectObject(hdc, hSmallFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+
+    std::wstring stats = L"Золото собрано: " + std::to_wstring(gold) +
+        L" | Шагов сделано: " + std::to_wstring(steps);
+    GetTextExtentPoint32(hdc, stats.c_str(), (int)stats.length(), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 300, stats.c_str(), (int)stats.length());
+
+    SetTextColor(hdc, RGB(100, 200, 255));
+    wchar_t continueText[] = L"Нажмите ENTER для меню или R для новой игры";
+    GetTextExtentPoint32(hdc, continueText, (int)wcslen(continueText), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 400, continueText, (int)wcslen(continueText));
+
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hFont);
+    DeleteObject(hSmallFont);
+}
+
+void DrawWinScreen(HDC hdc)
+{
+    HFONT hFont = CreateFont(48, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    HFONT hSmallFont = CreateFont(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+    RECT bgRect = { 0, 0, 960, 680 };
+    HBRUSH hBgBrush = CreateSolidBrush(RGB(20, 40, 20));
+    FillRect(hdc, &bgRect, hBgBrush);
+    DeleteObject(hBgBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(50, 255, 100));
+
+    wchar_t winText[] = L"ВЫ УБЕЖАЛИ ОТ ЗЛО_ТРАКТОРА!";
+    SIZE textSize;
+    GetTextExtentPoint32(hdc, winText, (int)wcslen(winText), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 100, winText, (int)wcslen(winText));
+
+    SelectObject(hdc, hSmallFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+
+    std::wstring stats = L"Золото: " + std::to_wstring(gold) + L" | Шаги: " + std::to_wstring(steps);
+    GetTextExtentPoint32(hdc, stats.c_str(), (int)stats.length(), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 250, stats.c_str(), (int)stats.length());
+
+    std::wstring roomsStats = L"Исследовано комнат: " + std::to_wstring(visitedRooms) + L"/" + std::to_wstring(totalRooms);
+    GetTextExtentPoint32(hdc, roomsStats.c_str(), (int)roomsStats.length(), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 300, roomsStats.c_str(), (int)roomsStats.length());
+
+    SetTextColor(hdc, RGB(100, 200, 255));
+    wchar_t continueText[] = L"Нажмите ENTER для меню";
+    GetTextExtentPoint32(hdc, continueText, (int)wcslen(continueText), &textSize);
+    TextOut(hdc, (960 - textSize.cx) / 2, 450, continueText, (int)wcslen(continueText));
+
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hFont);
+    DeleteObject(hSmallFont);
 }
 
 void MovePlayer(int dx, int dy)
@@ -797,81 +1428,113 @@ void MovePlayer(int dx, int dy)
     int newX = playerPos.x + dx;
     int newY = playerPos.y + dy;
 
-    // Проверяем выход за границы
     if (newX < 0 || newX >= TOTAL_WIDTH || newY < 0 || newY >= TOTAL_HEIGHT)
         return;
 
-    // Проверяем клетку назначения
-    int targetCell = map[newY][newX];
+    // Посетить комнату при входе в любую клетку
+    int newRoomX = newX / ROOM_WIDTH;
+    int newRoomY = newY / ROOM_HEIGHT;
+    VisitRoom(newRoomX, newRoomY);
 
-    // Объявляем переменные ДО switch
+    int targetCell = map[newY * TOTAL_WIDTH + newX];
+
     int roomX = 0, roomY = 0;
     int dxRoom = 0, dyRoom = 0;
 
     switch (targetCell)
     {
     case EMPTY:
-        map[playerPos.y][playerPos.x] = EMPTY;
-        map[newY][newX] = PLAYER;
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+        map[newY * TOTAL_WIDTH + newX] = PLAYER;
         steps++;
         break;
 
     case GOLD:
-        map[playerPos.y][playerPos.x] = EMPTY;
-        map[newY][newX] = PLAYER;
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+        map[newY * TOTAL_WIDTH + newX] = PLAYER;
         gold += 5 + rand() % 15;
         steps++;
         break;
 
-    case WALL:
-        DamagePlayer(3);
+    case KEY:
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+        map[newY * TOTAL_WIDTH + newX] = PLAYER;
+        keys++;
         steps++;
         break;
 
-    case DOOR:
-        // Определяем направление перехода
+    case WALL:
+        if (!godMode)
+            DamagePlayer(3);
+        steps++;
+        break;
+
+    case FREE_DOOR:
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
         roomX = newX / ROOM_WIDTH;
         roomY = newY / ROOM_HEIGHT;
 
         if (roomX != currentRoomX || roomY != currentRoomY)
         {
-            // Меняем комнату
             dxRoom = roomX - currentRoomX;
             dyRoom = roomY - currentRoomY;
+            RemoveDoorInBothRooms(newX, newY, dxRoom * ROOM_WIDTH, dyRoom * ROOM_HEIGHT);
             ChangeRoom(dxRoom, dyRoom);
         }
         else
         {
-            // В пределах той же комнаты - просто перемещаемся
-            map[playerPos.y][playerPos.x] = EMPTY;
-            map[newY][newX] = PLAYER;
+            map[newY * TOTAL_WIDTH + newX] = PLAYER;
         }
         steps++;
         break;
 
+    case DOOR:
+        if (keys > 0 || godMode)
+        {
+            if (!godMode) keys--;
+            map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+            roomX = newX / ROOM_WIDTH;
+            roomY = newY / ROOM_HEIGHT;
+
+            if (roomX != currentRoomX || roomY != currentRoomY)
+            {
+                dxRoom = roomX - currentRoomX;
+                dyRoom = roomY - currentRoomY;
+                RemoveDoorInBothRooms(newX, newY, dxRoom * ROOM_WIDTH, dyRoom * ROOM_HEIGHT);
+                ChangeRoom(dxRoom, dyRoom);
+            }
+            else
+            {
+                map[newY * TOTAL_WIDTH + newX] = PLAYER;
+            }
+        }
+        steps++;
+        break;
+
+    case EXIT_DOOR:
+        gameState = WIN_SCREEN;
+        steps++;
+        break;
+
     case HEALTH:
-        map[playerPos.y][playerPos.x] = EMPTY;
-        map[newY][newX] = PLAYER;
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+        map[newY * TOTAL_WIDTH + newX] = PLAYER;
         HealPlayer(25);
         steps++;
         break;
 
     case TRAP:
-        map[playerPos.y][playerPos.x] = EMPTY;
-        map[newY][newX] = PLAYER;
-        DamagePlayer(20);
+        map[playerPos.y * TOTAL_WIDTH + playerPos.x] = EMPTY;
+        map[newY * TOTAL_WIDTH + newX] = PLAYER;
+        if (!godMode)
+            DamagePlayer(20);
         steps++;
         break;
     }
 
-    // Проверяем смерть игрока
-    if (health <= 0)
+    if (health <= 0 && !godMode)
     {
-        MessageBox(NULL, L"Вы погибли! Начинаем новую игру.", L"Game Over", MB_OK);
-        health = 100;
-        gold = 0;
-        steps = 0;
-        GenerateMap();
+        gameState = GAME_OVER;
     }
 }
 
@@ -887,57 +1550,19 @@ void HealPlayer(int amount)
     if (health > 100) health = 100;
 }
 
-void SaveGame()
+void UpdateFPS()
 {
-    FILE* file = fopen("savegame.dat", "wb");
-    if (file)
+    static DWORD lastTime = GetTickCount();
+    static int frames = 0;
+
+    DWORD currentTime = GetTickCount();
+    frames++;
+
+    if (currentTime - lastTime >= 1000)
     {
-        // Сохраняем карту
-        size_t mapSize = (size_t)TOTAL_HEIGHT * (size_t)TOTAL_WIDTH;
-        fwrite(map, sizeof(int), mapSize, file);
-
-        // Сохраняем информацию о посещенных комнатах
-        size_t exploredSize = (size_t)ROOMS_Y * (size_t)ROOMS_X;
-        fwrite(explored, sizeof(bool), exploredSize, file);
-
-        // Сохраняем игровые переменные
-        fwrite(&currentRoomX, sizeof(int), 1, file);
-        fwrite(&currentRoomY, sizeof(int), 1, file);
-        fwrite(&steps, sizeof(int), 1, file);
-        fwrite(&gold, sizeof(int), 1, file);
-        fwrite(&health, sizeof(int), 1, file);
-        fwrite(&visitedRooms, sizeof(int), 1, file);
-
-        fclose(file);
-
-        MessageBox(NULL, L"Игра сохранена!", L"Сохранение", MB_OK);
-    }
-}
-
-void LoadGame()
-{
-    FILE* file = fopen("savegame.dat", "rb");
-    if (file)
-    {
-        // Загружаем карту
-        size_t mapSize = (size_t)TOTAL_HEIGHT * (size_t)TOTAL_WIDTH;
-        fread(map, sizeof(int), mapSize, file);
-
-        // Загружаем информацию о посещенных комнатах
-        size_t exploredSize = (size_t)ROOMS_Y * (size_t)ROOMS_X;
-        fread(explored, sizeof(bool), exploredSize, file);
-
-        // Загружаем игровые переменные
-        fread(&currentRoomX, sizeof(int), 1, file);
-        fread(&currentRoomY, sizeof(int), 1, file);
-        fread(&steps, sizeof(int), 1, file);
-        fread(&gold, sizeof(int), 1, file);
-        fread(&health, sizeof(int), 1, file);
-        fread(&visitedRooms, sizeof(int), 1, file);
-
-        fclose(file);
-
-        MessageBox(NULL, L"Игра загружена!", L"Загрузка", MB_OK);
+        currentFPS = (float)frames;
+        frames = 0;
+        lastTime = currentTime;
     }
 }
 
@@ -950,9 +1575,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
 
-        // Рисуем карту и интерфейс
-        DrawMap(hdc);
-        DrawUI(hdc);
+        if (gameState == PLAYING && hdcBuffer)
+        {
+            RECT rcClient;
+            GetClientRect(hWnd, &rcClient);
+
+            if (bufferWidth != rcClient.right || bufferHeight != rcClient.bottom)
+            {
+                CreateBuffer(rcClient.right, rcClient.bottom);
+            }
+
+            // Очищаем буфер
+            HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdcBuffer, &rcClient, hBrush);
+            DeleteObject(hBrush);
+
+            DrawMap(hdcBuffer);
+            DrawUI(hdcBuffer);
+
+            BitBlt(hdc, 0, 0, bufferWidth, bufferHeight, hdcBuffer, 0, 0, SRCCOPY);
+        }
+        else
+        {
+            switch (gameState)
+            {
+            case MENU:
+                DrawMenu(hdc);
+                break;
+            case DIFFICULTY_SELECT:
+                DrawDifficultySelect(hdc);
+                break;
+            case GAME_OVER:
+                DrawGameOver(hdc);
+                break;
+            case WIN_SCREEN:
+                DrawWinScreen(hdc);
+                break;
+            }
+        }
 
         EndPaint(hWnd, &ps);
     }
@@ -960,56 +1620,131 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_KEYDOWN:
     {
-        switch (wParam)
+        switch (gameState)
         {
-        case VK_LEFT:
-            MovePlayer(-1, 0);
-            InvalidateRect(hWnd, NULL, TRUE);
+        case MENU:
+            if (wParam == VK_RETURN)
+            {
+                selectedDifficulty = 1;
+                gameState = DIFFICULTY_SELECT;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
             break;
 
-        case VK_RIGHT:
-            MovePlayer(1, 0);
-            InvalidateRect(hWnd, NULL, TRUE);
+        case DIFFICULTY_SELECT:
+            if (wParam == VK_UP && selectedDifficulty > 1)
+            {
+                selectedDifficulty--;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            else if (wParam == VK_DOWN && selectedDifficulty < 3)
+            {
+                selectedDifficulty++;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            else if (wParam == VK_RETURN)
+            {
+                StartNewGame(selectedDifficulty);
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
             break;
 
-        case VK_UP:
-            MovePlayer(0, -1);
-            InvalidateRect(hWnd, NULL, TRUE);
+        case PLAYING:
+        {
+            switch (wParam)
+            {
+            case VK_LEFT:
+                MovePlayer(-1, 0);
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case VK_RIGHT:
+                MovePlayer(1, 0);
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case VK_UP:
+                MovePlayer(0, -1);
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case VK_DOWN:
+                MovePlayer(0, 1);
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case 'I':
+                uiExpanded = !uiExpanded;
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case 'G':
+                godMode = !godMode;
+                if (godMode) health = 100;
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case 'R':
+                gameState = DIFFICULTY_SELECT;
+                selectedDifficulty = 1;
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+
+            case VK_ESCAPE:
+                gameState = MENU;
+                InvalidateRect(hWnd, NULL, FALSE);
+                break;
+            }
+        }
+        break;
+
+        case GAME_OVER:
+            if (wParam == VK_RETURN)
+            {
+                gameState = MENU;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            else if (wParam == 'R')
+            {
+                gameState = DIFFICULTY_SELECT;
+                selectedDifficulty = 1;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
             break;
 
-        case VK_DOWN:
-            MovePlayer(0, 1);
-            InvalidateRect(hWnd, NULL, TRUE);
-            break;
-
-        case 'S':
-            SaveGame();
-            InvalidateRect(hWnd, NULL, TRUE);
-            break;
-
-        case 'F':
-            LoadGame();
-            InvalidateRect(hWnd, NULL, TRUE);
-            break;
-
-        case 'R':
-            health = 100;
-            gold = 0;
-            steps = 0;
-            currentRoomX = 1;
-            currentRoomY = 1;
-            GenerateMap();
-            InvalidateRect(hWnd, NULL, TRUE);
-            break;
-
-        case VK_ESCAPE:
-            PostQuitMessage(0);
+        case WIN_SCREEN:
+            if (wParam == VK_RETURN)
+            {
+                gameState = MENU;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
             break;
         }
     }
     break;
 
+    case WM_TIMER:
+        UpdateFPS();
+        InvalidateRect(hWnd, NULL, FALSE);
+        break;
+
+    case WM_CREATE:
+        SetTimer(hWnd, 1, 16, NULL);
+        break;
+
+    case WM_SIZE:
+    {
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+        if (gameState == PLAYING)
+        {
+            CreateBuffer(rcClient.right, rcClient.bottom);
+        }
+    }
+    break;
+
     case WM_DESTROY:
+        KillTimer(hWnd, 1);
         PostQuitMessage(0);
         break;
 
